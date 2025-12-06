@@ -1,117 +1,151 @@
-# src/train_models.py
-import os
-import joblib
-from datetime import datetime
-import numpy as np
+# src/preprocess.py
 import pandas as pd
-import json
-import traceback
-
+import numpy as np
+import joblib
 from sklearn.pipeline import Pipeline
-from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
-from sklearn.metrics import accuracy_score, precision_score, recall_score, roc_auc_score, confusion_matrix
-from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
-from sklearn.model_selection import train_test_split
+from sklearn.impute import SimpleImputer
+from sklearn.preprocessing import StandardScaler, OneHotEncoder
+from sklearn.compose import ColumnTransformer
+import sklearn
 
-# local imports
-from src.preprocess import basic_cleaning, fill_missing_domain, feature_engineering, create_targets, build_preprocessor, save_object
-from src.utils import load_data
+CURRENT_YEAR = 2025
 
-MLFLOW_EXPERIMENT = "real_estate_investment_advisor"
+def basic_cleaning(df):
+    # Drop exact duplicates
+    df = df.drop_duplicates(subset=["ID"], keep="first") if "ID" in df.columns else df.drop_duplicates()
+    # Normalize column names
+    df.columns = [c.strip() for c in df.columns]
+    return df
 
-# Try to import mlflow; if it fails, continue without mlflow logging
-use_mlflow = True
-try:
-    import mlflow
-    import mlflow.sklearn
-except Exception as e:
-    use_mlflow = False
-    MLFLOW_IMPORT_ERROR = traceback.format_exc()
-    print("Warning: mlflow import failed. Continuing without MLflow. Error:")
-    print(MLFLOW_IMPORT_ERROR)
+def fill_missing_domain(df):
+    # Simple heuristics for missing numeric fields
+    numeric_cols = df.select_dtypes(include=["int64", "float64"]).columns.tolist()
+    for c in numeric_cols:
+        df[c] = df[c].fillna(df[c].median())
+    # Fill categorical with 'Unknown'
+    cat_cols = df.select_dtypes(include=["object"]).columns.tolist()
+    for c in cat_cols:
+        df[c] = df[c].fillna("Unknown")
+    return df
 
-def evaluate_classification(model, X_test, y_test):
-    y_pred = model.predict(X_test)
+def feature_engineering(df):
+    # Price per sqft if missing or inconsistent
+    if "Price_per_SqFt" not in df.columns or df["Price_per_SqFt"].isnull().any():
+        if "Price_in_Lakhs" in df.columns and "Size_in_SqFt" in df.columns:
+            # Price_in_Lakhs * 1e5 -> rupees, but keep in same units: lakhs/sqft
+            df["Price_per_SqFt"] = (df["Price_in_Lakhs"] * 100000) / df["Size_in_SqFt"]
+        else:
+            df["Price_per_SqFt"] = df.get("Price_per_SqFt", np.nan).fillna(df["Price_per_SqFt"].median())
+
+    # Age_of_Property if missing
+    if "Year_Built" in df.columns and "Age_of_Property" not in df.columns:
+        df["Age_of_Property"] = CURRENT_YEAR - df["Year_Built"].fillna(CURRENT_YEAR)
+
+    # avoid chained-assignment / inplace warning by assigning result back
+    df["Price_per_SqFt"] = df["Price_per_SqFt"].replace([np.inf, -np.inf], np.nan)
+    df["Price_per_SqFt"] = df["Price_per_SqFt"].fillna(df["Price_per_SqFt"].median())
+
+    # Price per BHK: avoid division by zero
+    df["BHK"] = df["BHK"].fillna(1).replace(0, 1)
+    df["Price_per_BHK"] = df["Price_in_Lakhs"] / df["BHK"]
+
+    # Amenities count (if amenities string exists)
+    if "Amenities" in df.columns:
+        df["Amenities_Count"] = df["Amenities"].fillna("").apply(lambda s: len([x for x in str(s).split(",") if x.strip()]))
+    else:
+        df["Amenities_Count"] = 0
+
+    # School density score (normalize Nearby_Schools)
+    if "Nearby_Schools" in df.columns:
+        df["School_Density"] = (df["Nearby_Schools"] - df["Nearby_Schools"].min()) / (df["Nearby_Schools"].max() - df["Nearby_Schools"].min() + 1e-6)
+    else:
+        df["School_Density"] = 0.0
+
+    # Public transport numeric
+    if "Public_Transport_Accessibility" in df.columns:
+        # if it's textual, map common words to numeric
+        def map_transport(x):
+            if pd.isna(x): return 0
+            s = str(x).lower()
+            if any(k in s for k in ["excellent", "high", "very good"]): return 3
+            if any(k in s for k in ["good", "medium"]): return 2
+            if any(k in s for k in ["poor", "low"]): return 1
+            # if number
+            try:
+                return float(x)
+            except:
+                return 1
+        df["Transport_Score"] = df["Public_Transport_Accessibility"].apply(map_transport)
+    else:
+        df["Transport_Score"] = 1
+
+    return df
+
+def create_targets(df, growth_rate_lookup=None, fixed_rate=0.08, years=5):
+    # Regression target: simple growth projection and/or feature-based later
+    if "Price_in_Lakhs" in df.columns:
+        # create future price using per-city growth rates if provided
+        df["City"] = df.get("City", "Unknown")
+        if growth_rate_lookup is None:
+            growth_rate_lookup = {}
+        def city_growth(row):
+            r = growth_rate_lookup.get(row["City"], fixed_rate)
+            return row["Price_in_Lakhs"] * ((1 + r) ** years)
+        df["Future_Price_5Y"] = df.apply(city_growth, axis=1)
+    else:
+        raise ValueError("Price_in_Lakhs must exist to create Future_Price_5Y")
+
+    # Classification target: Good_Investment (binary)
+    # Rule-based score:
+    median_price = df["Price_in_Lakhs"].median()
+    df["Is_Cheap"] = (df["Price_in_Lakhs"] <= median_price).astype(int)
+    df["Good_BHK"] = (df["BHK"] >= 3).astype(int)
+    df["Ready_to_Move"] = df.get("Availability_Status", "").apply(lambda x: 1 if str(x).lower() in ["ready to move", "available"] else 0)
+    df["RERA_flag"] = df.get("RERA", 0) if "RERA" in df.columns else 0
+
+    # Combined score threshold
+    df["Investment_Score"] = df["Is_Cheap"] + df["Good_BHK"] + df["Ready_to_Move"] + (df["RERA_flag"]>0).astype(int) + (df["School_Density"]>0.5).astype(int)
+    df["Good_Investment"] = (df["Investment_Score"] >= 3).astype(int)
+    return df
+
+def build_preprocessor(df):
+    # Define which columns to treat as numeric/categorical
+    numeric_cols = [
+        c for c in df.select_dtypes(include=["int64", "float64"]).columns
+        if c not in ("Good_Investment", "Future_Price_5Y")
+    ]
+    # choose a small set of categorical columns commonly present
+    cat_cols = [c for c in ["State","City","Locality","Property_Type","Furnished_Status","Security","Facing","Owner_Type","Availability_Status"] if c in df.columns]
+
+    numeric_transformer = Pipeline(steps=[
+        ("imputer", SimpleImputer(strategy="median")),
+        ("scaler", StandardScaler())
+    ])
+
+    # Build OneHotEncoder kwargs depending on sklearn version
+    skl_ver = getattr(sklearn, "__version__", "0.0")
     try:
-        y_proba = model.predict_proba(X_test)[:,1]
+        major, minor = [int(x) for x in skl_ver.split(".")[:2]]
     except Exception:
-        # fallback to zeros if no proba
-        y_proba = np.zeros(len(y_test))
-    return {
-        "accuracy": float(accuracy_score(y_test, y_pred)),
-        "precision": float(precision_score(y_test, y_pred, zero_division=0)),
-        "recall": float(recall_score(y_test, y_pred, zero_division=0)),
-        "roc_auc": float(roc_auc_score(y_test, y_proba)) if y_proba.sum() != 0 else None,
-        "confusion_matrix": confusion_matrix(y_test, y_pred).tolist()
-    }
+        major, minor = 0, 0
 
-def evaluate_regression(model, X_test, y_test):
-    y_pred = model.predict(X_test)
-    return {
-        "rmse": float(mean_squared_error(y_test, y_pred, squared=False)),
-        "mae": float(mean_absolute_error(y_test, y_pred)),
-        "r2": float(r2_score(y_test, y_pred))
-    }
+    ohe_kwargs = {}
+    if (major, minor) >= (1, 2):
+        # sklearn >=1.2 uses sparse_output
+        ohe_kwargs["sparse_output"] = False
+    else:
+        ohe_kwargs["sparse"] = False
 
-def train(save_dir="models", data_path="data/india_housing_prices.csv"):
-    os.makedirs(save_dir, exist_ok=True)
+    categorical_transformer = Pipeline(steps=[
+        ("imputer", SimpleImputer(strategy="constant", fill_value="Unknown")),
+        ("onehot", OneHotEncoder(handle_unknown="ignore", **ohe_kwargs))
+    ])
 
-    # load and preprocess
-    df = load_data(data_path)
-    df = basic_cleaning(df)
-    df = fill_missing_domain(df)
-    df = feature_engineering(df)
-    df = create_targets(df)
+    preprocessor = ColumnTransformer(transformers=[
+        ("num", numeric_transformer, numeric_cols),
+        ("cat", categorical_transformer, cat_cols)
+    ], remainder="drop")
+    return preprocessor, numeric_cols, cat_cols
 
-    preprocessor, numeric_cols, cat_cols = build_preprocessor(df)
-    save_object(preprocessor, os.path.join(save_dir,"preprocessor.joblib"))
-
-    # Prepare training splits
-    X = df.drop(columns=["Future_Price_5Y","Good_Investment"], errors='ignore')
-    y_reg = df["Future_Price_5Y"]
-    y_clf = df["Good_Investment"]
-    X_train, X_test, y_reg_train, y_reg_test, y_clf_train, y_clf_test = train_test_split(
-        X, y_reg, y_clf, test_size=0.2, random_state=42
-    )
-
-    # Classification pipeline
-    clf = RandomForestClassifier(n_estimators=200, random_state=42, n_jobs=-1)
-    clf_pipeline = Pipeline(steps=[("preprocessor", preprocessor), ("clf", clf)])
-
-    # Regression pipeline
-    reg = RandomForestRegressor(n_estimators=200, random_state=42, n_jobs=-1)
-    reg_pipeline = Pipeline(steps=[("preprocessor", preprocessor), ("reg", reg)])
-
-    clf_pipeline.fit(X_train, y_clf_train)
-    clf_eval = evaluate_classification(clf_pipeline, X_test, y_clf_test)
-    joblib.dump(clf_pipeline, os.path.join(save_dir, "classifier_pipeline.joblib"))
-
-    reg_pipeline.fit(X_train, y_reg_train)
-    reg_eval = evaluate_regression(reg_pipeline, X_test, y_reg_test)
-    joblib.dump(reg_pipeline, os.path.join(save_dir, "regressor_pipeline.joblib"))
-
-    summary = {"classification": clf_eval, "regression": reg_eval}
-    with open(os.path.join(save_dir, "eval_summary.json"), "w") as f:
-        json.dump(summary, f, indent=2)
-
-    # If mlflow is available, try to log runs (non-fatal)
-    if use_mlflow:
-        try:
-            mlflow.set_experiment(MLFLOW_EXPERIMENT)
-            with mlflow.start_run(run_name=f"clf_rf_{datetime.now().isoformat()}"):
-                mlflow.log_params({"model_type":"RandomForestClassifier", "n_estimators":200})
-                mlflow.log_metrics({k: v for k,v in clf_eval.items() if isinstance(v, (int,float))})
-                mlflow.sklearn.log_model(clf_pipeline, "clf_model")
-            with mlflow.start_run(run_name=f"reg_rf_{datetime.now().isoformat()}"):
-                mlflow.log_params({"model_type":"RandomForestRegressor", "n_estimators":200})
-                mlflow.log_metrics({k: v for k,v in reg_eval.items() if isinstance(v, (int,float))})
-                mlflow.sklearn.log_model(reg_pipeline, "reg_model")
-        except Exception:
-            print("Warning: mlflow logging failed (non-fatal). Traceback:")
-            print(traceback.format_exc())
-
-    print("Training complete. Models saved to", save_dir)
-    return os.path.abspath(save_dir)
-
-if __name__ == "__main__":
-    train()
+def save_object(obj, path):
+    joblib.dump(obj, path)
