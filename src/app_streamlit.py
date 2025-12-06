@@ -18,6 +18,22 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 import plotly.express as px
+# --- Add at the very top of app_streamlit.py, before importing joblib or loading models ---
+import importlib
+
+try:
+    _ct_mod = importlib.import_module("sklearn.compose._column_transformer")
+except Exception:
+    _ct_mod = None
+
+if _ct_mod is not None and not hasattr(_ct_mod, "_RemainderColsList"):
+    # Minimal compatible placeholder: behaves like a list for unpickling.
+    class _RemainderColsList(list):
+        # ensure pickling/unpickling behaves like a list
+        def __reduce__(self):
+            return (list, (list(self),))
+    setattr(_ct_mod, "_RemainderColsList", _RemainderColsList)
+# --- end shim ---
 
 MODEL_DIR = "models"
 CLASSIFIER_PATH = os.path.join(MODEL_DIR, "classifier_pipeline.joblib")
